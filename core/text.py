@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Chuẩn hóa chữ, số, đơn vị cho hồ sơ khối lượng tiếng Việt."""
+import functools
 import re
 import unicodedata
 
@@ -15,11 +16,16 @@ def norm(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+@functools.lru_cache(maxsize=4096)
+def _wre(kw_n):
+    return re.compile(r"(?<![a-z0-9])" + re.escape(kw_n) + r"(?![a-z0-9])")
+
+
 def contains_word(text_n, kw_n):
     """Từ khóa (đã chuẩn hóa) có trong chuỗi, khớp theo ranh giới từ."""
     if not kw_n:
         return False
-    return re.search(r"(?<![a-z0-9])" + re.escape(kw_n) + r"(?![a-z0-9])", text_n) is not None
+    return _wre(kw_n).search(text_n) is not None
 
 
 def has_marks(s):
@@ -31,15 +37,33 @@ def low(s):
     return re.sub(r"\s+", " ", unicodedata.normalize("NFC", str(s or "")).lower()).strip()
 
 
-def kw_in(name, kw):
-    """So khớp từ khóa với tên công việc.
+@functools.lru_cache(maxsize=8192)
+def _kre(kw_low):
+    return re.compile(r"(?<!\w)" + re.escape(kw_low) + r"(?!\w)")
+
+
+@functools.lru_cache(maxsize=200000)
+def _forms(name):
+    """(chữ thường có dấu, chữ bỏ dấu, có dấu?) – tính một lần cho mỗi tên công việc."""
+    return low(name), norm(name), has_marks(name)
+
+
+def kw_pos(name, kw):
+    """Vị trí từ khóa trong tên công việc (−1 nếu không có).
     Tên và từ khóa đều có dấu → so có dấu (phân biệt cốt/cột, đài/dài, đắp/đáp).
     Tên không dấu (gõ không dấu, font cũ) → bỏ dấu cả hai rồi so."""
-    if not kw:
-        return False
-    if has_marks(name) and has_marks(kw):
-        return re.search(r"(?<!\w)" + re.escape(low(kw)) + r"(?!\w)", low(name)) is not None
-    return contains_word(norm(name), norm(kw))
+    if not kw or not name:
+        return -1
+    lname, nname, marks = _forms(str(name))
+    if marks and has_marks(kw):
+        m = _kre(low(kw)).search(lname)
+    else:
+        m = _wre(norm(kw)).search(nname)
+    return m.start() if m else -1
+
+
+def kw_in(name, kw):
+    return kw_pos(name, kw) >= 0
 
 
 _THOUSANDS_DOT = re.compile(r"^-?\d{1,3}(\.\d{3})+(,\d+)?$")

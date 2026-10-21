@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Nhận diện dòng tiêu đề, ghép cột và tách các dòng công việc từ một Sheet."""
+import functools
 import re
 from dataclasses import dataclass, field
 
@@ -28,7 +29,7 @@ VAL_KEYS = ("tt_luyke", "tt_kynay", "thanhtien", "tt_hd", "tt_truoc")
 
 P_TRUOC = ["ky truoc", "dot truoc", "lan truoc", "den het ky truoc", "den ky truoc", "luy ke truoc",
            "da thanh toan", "da nghiem thu", "giai doan truoc"]
-P_LUYKE = ["luy ke", "den het ky nay", "den het dot nay", "den nay", "tong cong"]
+P_LUYKE = ["luy ke", "den het ky nay", "den het dot nay", "den nay", "tong cong", "quyet toan"]
 P_KYNAY = ["ky nay", "dot nay", "lan nay", "de nghi", "thuc hien", "nghiem thu", "giai doan nay"]
 P_HD = ["hop dong", "hd", "du toan", "thiet ke", "tk", "duoc duyet", "boq", "phe duyet", "goi thau", "theo hop"]
 DIM_WORDS = ["dai", "rong", "cao", "so luong", "so ck", "so cau kien", "he so", "day", "dien tich", "the tich", "chu vi"]
@@ -38,6 +39,7 @@ def _has(t, words):
     return any(contains_word(t, w) for w in words)
 
 
+@functools.lru_cache(maxsize=20000)
 def classify(text):
     """Trả khóa cột từ chữ tiêu đề (đã gộp nhiều dòng)."""
     t = norm(text)
@@ -200,6 +202,7 @@ PHAN_RULES = [
 ]
 
 
+@functools.lru_cache(maxsize=100000)
 def guess_phan(name, section=""):
     for txt in (name, section):
         if not txt:
@@ -220,7 +223,7 @@ def parse(sheet, tmap):
     if tmap.data_start is None or "ten" not in tmap.cols:
         return items, totals
     cols = tmap.cols
-    section = ""
+    section, trail = "", []
     head_ten = norm(_cell(sheet.head_grid[tmap.header_row], cols["ten"])) if tmap.header_row is not None else ""
     for i in range(tmap.data_start, len(sheet.grid)):
         row = sheet.grid[i]
@@ -228,6 +231,8 @@ def parse(sheet, tmap):
         name_s = str(name).strip() if name is not None else ""
         dvt_raw = _cell(row, cols.get("dvt"))
         dvt_raw = str(dvt_raw).strip() if dvt_raw not in (None, "") else ""
+        if dvt_raw in ("0", "-", "–", "0.0"):
+            dvt_raw = ""
         if not name_s:
             continue
         nn = norm(name_s)
@@ -255,7 +260,8 @@ def parse(sheet, tmap):
             continue
         if not dvt_raw and not has_qty:
             if has_val or is_section_code(stt) or name_s.isupper() or len(name_s) < 120:
-                section = name_s[:120]
+                trail = (trail + [name_s[:80]])[-3:]      # giữ 3 cấp tiêu đề gần nhất (phụ lục / phần / nhóm)
+                section = " / ".join(trail)
             continue
         if sheet.formula is not None:
             for k in ("kynay", "luyke", "kl"):

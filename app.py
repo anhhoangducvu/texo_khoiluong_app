@@ -25,7 +25,7 @@ from core.text import fmt
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO = os.path.join(APP_DIR, "assets", "logo_texo.png")
 SECRETS_FILE = os.path.join(APP_DIR, ".secrets.json")
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 LEVELS = ["Cao", "Trung bình", "Thấp"]
 PHAN = ["Đất, hố móng", "Cọc", "Móng, tầng hầm", "Bê tông cốt thép", "Hoàn thiện", "Cơ điện", "Cải tạo",
         "Hạ tầng", "Chung"]
@@ -190,10 +190,11 @@ def file_hash(up):
 def load_book(up, slot):
     h = file_hash(up)
     if st.session_state.get(f"{slot}_hash") != h:
-        with st.spinner(f"Đang đọc {up.name}…"):
+        with st.spinner(f"Đang đọc {up.name} (file lớn, nhiều sheet có thể mất 10–30 giây)…"):
             st.session_state[slot] = reader.load(io.BytesIO(up.getvalue()), name=up.name)
         st.session_state[f"{slot}_hash"] = h
         st.session_state.pop(f"{slot}_ov", None)
+        st.session_state.pop(f"{slot}_an_cache", None)
         if slot == "book":
             for k in ("result", "ai_res", "points_base", "points_edit"):
                 st.session_state.pop(k, None)
@@ -228,35 +229,88 @@ def preview_df(sheet, start, n=10):
     return df
 
 
+def analyze_cached(book, ov, slot):
+    """Phân tích có lưu đệm theo (file, cấu hình) để mỗi lần bấm không phải quét lại cả chục sheet."""
+    key = (st.session_state.get(f"{slot}_hash"), json.dumps(ov, sort_keys=True, ensure_ascii=False))
+    cache = st.session_state.setdefault(f"{slot}_an_cache", {})
+    if key not in cache:
+        cache.clear()
+        cache[key] = engine.analyze(book, ov)
+    return cache[key]
+
+
 def mapping_ui(book, slot):
-    """Cho người dùng sửa vai trò sheet, dòng tiêu đề, cột. Trả overrides."""
+    """Bảng vai trò các sheet (một bảng, không phải mỗi sheet một khối) + chỉnh cột cho từng sheet khi cần."""
     ov = st.session_state.setdefault(f"{slot}_ov", {})
-    base = engine.analyze(book, ov)
-    for a, sh in zip(base, book.sheets):
-        ico = {"Tổng hợp": "📋", "Chi tiết": "📐", "Bỏ qua": "⏭️"}[a.role]
-        with st.expander(f"{ico} {sh.name} — {a.role} · {len(a.items)} dòng công việc"
-                         + (" · sheet ẩn" if sh.hidden else ""), expanded=False):
-            c1, c2, c3 = st.columns([1.2, 1, 1])
-            role = c1.selectbox("Vai trò", ROLES, index=ROLES.index(a.role), key=f"{slot}_role_{sh.name}")
+    base = analyze_cached(book, ov, slot)
+    auto_role = {sh.name: ("Bỏ qua" if sh.hidden else engine.guess_role(sh, sh._tmap)) for sh in book.sheets}
+
+    def cols_txt(a):
+        if a.role == "Bỏ qua" or not a.tmap.cols:
+            return ""
+        return ", ".join(f"{COL_KEYS[k]}: {get_column_letter(c + 1)}" for k, c in a.tmap.cols.items()
+                         if k in COL_KEYS and k not in ("stt", "ma"))
+
+    tbl = pd.DataFrame([{"Sheet": a.name, "Ẩn": "ẩn" if a.hidden else "", "Vai trò": a.role,
+                         "Dòng công việc": len(a.items), "Cột app nhận được": cols_txt(a)} for a in base])
+    n_sum = sum(1 for a in base if a.role == "Tổng hợp")
+    st.caption(f"{len(base)} sheet · {n_sum} bảng tổng hợp được quét theo quy tắc · sheet ẩn mặc định Bỏ qua. "
+               "Đổi vai trò ngay trong bảng.")
+    ed = st.data_editor(tbl, key=f"{slot}_roles_{st.session_state.get(f'{slot}_hash')}", hide_index=True,
+                        width="stretch", height=min(420, 40 + 35 * len(tbl)),
+                        disabled=["Sheet", "Ẩn", "Dòng công việc", "Cột app nhận được"],
+                        column_config={"Vai trò": st.column_config.SelectboxColumn(options=ROLES, width="small"),
+                                       "Ẩn": st.column_config.TextColumn(width="small"),
+                                       "Dòng công việc": st.column_config.NumberColumn(width="small")})
+    changed = False
+    for _, row in ed.iterrows():
+        name, role = row["Sheet"], row["Vai trò"]
+        cur = (ov.get(name) or {}).get("role")
+        if role != auto_role.get(name) and role != cur:
+            ov.setdefault(name, {})["role"] = role
+            changed = True
+        elif role == auto_role.get(name) and cur is not None:
+            ov[name].pop("role", None)
+            if not ov[name]:
+                ov.pop(name)
+            changed = True
+    if changed:
+        st.rerun()
+
+    names = [a.name for a in base if a.role != "Bỏ qua"] + [a.name for a in base if a.role == "Bỏ qua"]
+    pick = st.selectbox("Chỉnh dòng tiêu đề, cột cho một sheet (khi app nhận sai)", ["—"] + names,
+                        key=f"{slot}_pick")
+    if pick != "—":
+        sh = next(x for x in book.sheets if x.name == pick)
+        a = next(x for x in base if x.name == pick)
+        opts = col_options(sh, a.tmap)
+        with st.form(f"{slot}_form_{pick}"):
+            c2, c3 = st.columns(2)
             hr = c2.number_input("Dòng tiêu đề (số thứ tự)", min_value=1, max_value=max(1, len(sh.grid)),
-                                 value=(a.tmap.header_row or 0) + 1, key=f"{slot}_hr_{sh.name}")
+                                 value=(a.tmap.header_row or 0) + 1)
             ds = c3.number_input("Dòng số liệu đầu tiên", min_value=1, max_value=max(1, len(sh.grid)),
-                                 value=(a.tmap.data_start or 1) + 1, key=f"{slot}_ds_{sh.name}")
-            opts = col_options(sh, a.tmap)
-            cols = {}
-            keys = list(COL_KEYS)
+                                 value=(a.tmap.data_start or 1) + 1)
+            cols, keys = {}, list(COL_KEYS)
             grid = st.columns(5)
             for i, k in enumerate(keys):
                 cur = a.tmap.cols.get(k)
                 idx = cur + 1 if cur is not None and cur + 1 < len(opts) else 0
-                sel = grid[i % 5].selectbox(COL_KEYS[k], opts, index=idx, key=f"{slot}_c_{sh.name}_{k}")
+                sel = grid[i % 5].selectbox(COL_KEYS[k], opts, index=idx)
                 cols[k] = None if sel == "—" else opts.index(sel) - 1
             st.dataframe(preview_df(sh, max(0, hr - 1), 12), width="stretch", height=280)
-            new = {"role": role, "header_row": hr - 1, "data_start": ds - 1, "cols": cols}
-            auto = {"role": a.role, "header_row": a.tmap.header_row, "data_start": a.tmap.data_start,
-                    "cols": {k: a.tmap.cols.get(k) for k in keys}}
-            if new != auto:
-                ov[sh.name] = new
+            b1, b2 = st.columns(2)
+            ok = b1.form_submit_button("Áp dụng cho sheet này", type="primary", width="stretch")
+            reset = b2.form_submit_button("Trả về nhận diện tự động", width="stretch")
+        if ok:
+            o = ov.setdefault(pick, {})
+            o.update({"header_row": hr - 1, "data_start": ds - 1, "cols": cols})
+            st.rerun()
+        if reset:
+            role = (ov.get(pick) or {}).get("role")
+            ov.pop(pick, None)
+            if role:
+                ov[pick] = {"role": role}
+            st.rerun()
     return ov
 
 

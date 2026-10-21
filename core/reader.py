@@ -13,7 +13,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from dataclasses import dataclass, field
+
+from openpyxl.utils import get_column_letter
 
 ERR_PREFIX = ("#REF", "#VAL", "#DIV", "#N/A", "#NAM", "#NUM", "#NUL")
 
@@ -44,9 +47,16 @@ class Book:
     external_links: int = 0
     warnings: list = field(default_factory=list)
     scanned_pdf: bool = False
+    path: str = None
 
 
 # --------------------------------------------------------------------------- Excel
+MAX_ROWS = 8000          # số dòng đọc tối đa mỗi sheet (bảng tổng hợp hiếm khi vượt)
+MAX_COLS = 60            # số cột đọc tối đa
+EMPTY_STOP = 300         # gặp liên tiếp ngần này dòng trống thì coi như hết bảng
+HEAD_ROWS = 60           # vùng tìm dòng tiêu đề
+
+
 def _recalc_with_soffice(path):
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not soffice:
@@ -61,73 +71,217 @@ def _recalc_with_soffice(path):
         return None
 
 
-def _read_xlsx(path, display_name):
-    import openpyxl
-    wb_f = openpyxl.load_workbook(path, data_only=False)
-    wb_v = openpyxl.load_workbook(path, data_only=True)
-    warnings = []
+def _clean_copy(path):
+    """Bản sao gọn: bỏ khối <definedNames> (có file chứa hàng trăm nghìn tên rác, nặng hàng chục MB
+    làm openpyxl treo) và ảnh/đối tượng vẽ. Kết quả công thức đã lưu sẵn trong ô nên không ảnh hưởng số liệu.
+    Trả (đường dẫn, số KB tên rác đã bỏ)."""
+    out = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
+    removed = 0
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            name = info.filename
+            if name.startswith(("xl/media/", "xl/drawings/", "xl/printerSettings/", "xl/embeddings/")):
+                continue
+            data = zin.read(name)
+            if name == "xl/workbook.xml":
+                i, j = data.find(b"<definedNames"), data.find(b"</definedNames>")
+                if i >= 0 and j > i:
+                    removed = (j - i) // 1024
+                    data = data[:i] + data[j + len(b"</definedNames>"):]
+            elif name.startswith("xl/worksheets/_rels/") or name.startswith("xl/worksheets/sheet"):
+                # bỏ liên kết tới bản vẽ đã loại
+                data = re.sub(rb"<drawing [^>]*/>|<legacyDrawing [^>]*/>|<picture [^>]*/>", b"", data) \
+                    if name.startswith("xl/worksheets/sheet") else \
+                    re.sub(rb"<Relationship [^>]*(drawing|image|printerSettings|oleObject|vmlDrawing)[^>]*/>", b"", data)
+            zout.writestr(info, data)
+    return out, removed
 
-    # Ô công thức chưa có giá trị lưu sẵn (file do phần mềm khác xuất) → thử tính lại bằng LibreOffice
-    missing = 0
-    for ws in wb_f.worksheets:
-        wv = wb_v[ws.title]
-        for row in ws.iter_rows():
-            for c in row:
-                if isinstance(c.value, str) and c.value.startswith("="):
-                    if wv[c.coordinate].value is None:
-                        missing += 1
-                        if missing > 20:
-                            break
-            if missing > 20:
-                break
-    if missing > 20:
-        rc = _recalc_with_soffice(path)
-        if rc:
-            wb_v = openpyxl.load_workbook(rc, data_only=True)
-            warnings.append("File chưa lưu sẵn kết quả công thức; app đã tính lại bằng LibreOffice.")
+
+def _sheet_parts(zf):
+    """Tên sheet → đường dẫn XML trong gói."""
+    wb = zf.read("xl/workbook.xml").decode("utf-8", "ignore")
+    rels = zf.read("xl/_rels/workbook.xml.rels").decode("utf-8", "ignore")
+    rmap = {}
+    for m in re.finditer(r"<Relationship\b([^>]*)/?>", rels):
+        attrs = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+        tgt = attrs.get("Target", "")
+        tgt = tgt.lstrip("/")
+        if not tgt.startswith("xl/"):
+            tgt = "xl/" + tgt
+        rmap[attrs.get("Id")] = tgt
+    out = {}
+    for m in re.finditer(r"<sheet\b([^>]*)/>", wb):
+        name = re.search(r'name="([^"]*)"', m.group(1))
+        rid = re.search(r'r:id="([^"]*)"', m.group(1))
+        if name and rid:
+            nm = (name.group(1).replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                  .replace("&quot;", '"').replace("&apos;", "'"))
+            out[nm] = rmap.get(rid.group(1))
+    return out
+
+
+_ROW_HID = re.compile(rb'<row\b[^>]*?\br="(\d+)"[^>]*?\bhidden="(?:1|true)"')
+_ROW_HID2 = re.compile(rb'<row\b[^>]*?\bhidden="(?:1|true)"[^>]*?\br="(\d+)"')
+_NOVAL_RE = re.compile(rb"</f>(?:<v></v>|<v/>)?</c>|<f [^>]*/>(?:<v></v>|<v/>)?</c>")
+_NOVAL = [0]                      # đếm ô công thức không có giá trị lưu sẵn
+_MERGE = re.compile(rb'<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"')
+
+
+def _col_num(letters):
+    n = 0
+    for ch in letters.decode() if isinstance(letters, bytes) else letters:
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
+def _scan_meta(zf, member, max_rows):
+    """Đọc lướt XML sheet theo từng khúc: dòng ẩn và ô gộp vùng tiêu đề (không dựng cây XML)."""
+    hidden, merges = set(), []
+    if not member:
+        return hidden, merges
+    tail = b""
+    try:
+        with zf.open(member) as fh:
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                buf = tail + chunk
+                for rx in (_ROW_HID, _ROW_HID2):
+                    for m in rx.finditer(buf):
+                        r = int(m.group(1))
+                        if r <= max_rows:
+                            hidden.add(r - 1)
+                if _NOVAL[0] <= 50:
+                    _NOVAL[0] += len(_NOVAL_RE.findall(chunk))
+                for m in _MERGE.finditer(buf):
+                    r1, r2 = int(m.group(2)), int(m.group(4))
+                    if r1 <= HEAD_ROWS and r2 - r1 <= 3:
+                        merges.append((r1, _col_num(m.group(1)), r2, _col_num(m.group(3))))
+                tail = buf[-400:]
+    except KeyError:
+        pass
+    return hidden, list(dict.fromkeys(merges))
+
+
+def _stream_values(ws):
+    """Đọc giá trị theo luồng, dừng khi quá MAX_ROWS hoặc gặp EMPTY_STOP dòng trống liên tiếp."""
+    grid, empty, truncated = [], 0, False
+    for k, row in enumerate(ws.iter_rows(max_col=MAX_COLS, values_only=True)):
+        if k >= MAX_ROWS:
+            truncated = True
+            break
+        row = list(row)
+        if any(v not in (None, "") for v in row):
+            empty = 0
         else:
-            warnings.append("File có nhiều công thức chưa lưu sẵn kết quả (thường do phần mềm khác xuất). "
-                            "Mở file bằng Excel, bấm Lưu rồi tải lại để kết quả quét đầy đủ.")
+            empty += 1
+            if empty > EMPTY_STOP:
+                break
+        grid.append(row)
+    while grid and not any(v not in (None, "") for v in grid[-1]):
+        grid.pop()
+    nc = 0
+    for row in grid:
+        for c in range(len(row) - 1, -1, -1):
+            if row[c] not in (None, ""):
+                nc = max(nc, c + 1)
+                break
+    grid = [(r[:nc] + [None] * (nc - len(r[:nc]))) for r in grid]
+    return grid, truncated
 
+
+def _read_xlsx(path, display_name, _recalc=False):
+    import warnings as _w
+    import openpyxl
+    _w.filterwarnings("ignore", module="openpyxl")
+    warnings = []
+    _NOVAL[0] = 0
+    clean, removed = _clean_copy(path)
+    if removed > 1024:
+        warnings.append(f"File chứa khoảng {removed // 1024} MB tên vùng (defined names) thừa – app đã bỏ qua "
+                        "để đọc nhanh. Nên dọn Name Manager trong file gốc.")
+    wb_v = openpyxl.load_workbook(clean, read_only=True, data_only=True)
     ext = 0
     try:
-        ext = len(wb_f._external_links or [])
+        ext = len(wb_v._external_links or [])
     except Exception:
         pass
-
-    sheets = []
-    for ws in wb_f.worksheets:
-        wv = wb_v[ws.title]
-        nr, nc = ws.max_row or 0, min(ws.max_column or 0, 60)
-        grid, formula, errors = [], [], []
-        for r in range(1, nr + 1):
-            vals, fl = [], []
-            for c in range(1, nc + 1):
-                v = wv.cell(r, c).value
-                fv = ws.cell(r, c).value
-                vals.append(v)
-                fl.append(isinstance(fv, str) and fv.startswith("="))
+    zf = zipfile.ZipFile(clean)
+    parts = _sheet_parts(zf)
+    sheets, truncated = [], []
+    for ws in wb_v.worksheets:
+        grid, trunc = _stream_values(ws)
+        if trunc:
+            truncated.append(ws.title)
+        nr, nc = len(grid), (len(grid[0]) if grid else 0)
+        errors = []
+        for i, row in enumerate(grid):
+            for j, v in enumerate(row):
                 if isinstance(v, str) and v.strip().upper().startswith(ERR_PREFIX):
-                    errors.append(ws.cell(r, c).coordinate)
-            grid.append(vals)
-            formula.append(fl)
-        # Điền ô gộp cho vùng tiêu đề (≤ 60 dòng đầu, gộp ≤ 4 dòng)
-        head = [list(row) for row in grid[:60]]
-        for mr in ws.merged_cells.ranges:
-            r1, c1, r2, c2 = mr.min_row, mr.min_col, mr.max_row, mr.max_col
-            if r1 > 60 or r2 - r1 > 3:
+                    errors.append(f"{get_column_letter(j + 1)}{i + 1}")
+        hidden_rows, merges = _scan_meta(zf, parts.get(ws.title), max(nr, 1))
+        head = [list(row) for row in grid[:HEAD_ROWS]]
+        for r1, c1, r2, c2 in merges:
+            if r1 - 1 >= len(head) or c1 - 1 >= nc:
                 continue
-            v = grid[r1 - 1][c1 - 1] if r1 - 1 < len(grid) and c1 - 1 < nc else None
-            for rr in range(r1, min(r2, 60) + 1):
+            v = grid[r1 - 1][c1 - 1]
+            for rr in range(r1, min(r2, len(head)) + 1):
                 for cc in range(c1, min(c2, nc) + 1):
                     if head[rr - 1][cc - 1] is None:
                         head[rr - 1][cc - 1] = v
-        head += grid[60:]
-        hidden_rows = {r - 1 for r, d in ws.row_dimensions.items() if d.hidden and r <= nr}
-        sheets.append(Sheet(name=ws.title, kind="excel", grid=grid, head_grid=head, formula=formula,
-                            hidden_rows=hidden_rows, hidden=(ws.sheet_state != "visible"),
-                            labels=[f"dòng {i + 1}" for i in range(nr)], errors=errors))
-    return Book(source=display_name, kind="excel", sheets=sheets, external_links=ext, warnings=warnings)
+        head += grid[HEAD_ROWS:]
+        sheets.append(Sheet(name=ws.title, kind="excel", grid=grid, head_grid=head, formula=None,
+                            hidden_rows={r for r in hidden_rows if r < nr}, hidden=(ws.sheet_state != "visible"),
+                            labels=None, errors=errors))
+    zf.close()
+    wb_v.close()
+    if truncated:
+        warnings.append(f"Sheet dài hơn {MAX_ROWS} dòng chỉ đọc {MAX_ROWS} dòng đầu: " + ", ".join(truncated[:6])
+                        + ("…" if len(truncated) > 6 else "") + ".")
+    book = Book(source=display_name, kind="excel", sheets=sheets, external_links=ext, warnings=warnings)
+    book.path = clean
+    # Ô công thức chưa có kết quả lưu sẵn (file do phần mềm khác xuất): tính lại nếu file không quá lớn
+    if _NOVAL[0] > 20 and not _recalc:
+        if os.path.getsize(clean) < 8 * 1024 * 1024:
+            rc = _recalc_with_soffice(clean)
+            if rc:
+                b2 = _read_xlsx(rc, display_name, _recalc=True)
+                b2.warnings = warnings + ["File chưa lưu sẵn kết quả công thức; app đã tính lại bằng LibreOffice."]
+                return b2
+        book.warnings.append("File có nhiều công thức chưa lưu sẵn kết quả (thường do phần mềm khác xuất). "
+                             "Mở file bằng Excel, bấm Lưu rồi tải lại để kết quả quét đầy đủ.")
+    return book
+
+
+def load_formulas(book, names):
+    """Nạp cờ 'ô là công thức' cho các sheet cần (lazy, chỉ bảng tổng hợp), đọc theo luồng."""
+    path = getattr(book, "path", None)
+    if not path or book.kind != "excel":
+        return
+    need = [sh for sh in book.sheets if sh.name in names and sh.formula is None]
+    if not need:
+        return
+    import openpyxl
+    wb_f = openpyxl.load_workbook(path, read_only=True, data_only=False)
+    missing = 0
+    for sh in need:
+        nr, nc = len(sh.grid), (len(sh.grid[0]) if sh.grid else 0)
+        fl = []
+        if nc:
+            for k, row in enumerate(wb_f[sh.name].iter_rows(max_row=nr, max_col=nc, values_only=True)):
+                flags = [isinstance(v, str) and v.startswith("=") for v in row] + [False] * (nc - len(row))
+                for j, f in enumerate(flags):
+                    if f and sh.grid[k][j] is None:
+                        missing += 1
+                fl.append(flags)
+        fl += [[False] * nc for _ in range(nr - len(fl))]
+        sh.formula = fl
+    wb_f.close()
+    if missing > 20 and not getattr(book, "recalc_tried", False):
+        book.recalc_tried = True
+        book.warnings.append("Bảng tổng hợp có công thức chưa lưu sẵn kết quả (file do phần mềm khác xuất). "
+                             "Mở file bằng Excel, bấm Lưu rồi tải lại để kết quả quét đầy đủ.")
 
 
 def _read_xls(path, display_name):

@@ -44,6 +44,14 @@ streamlit run app.py
 - Không cần LibreOffice. Có LibreOffice thì app tự tính lại công thức cho file Excel chưa lưu sẵn kết quả.
 - Kiểm thử: `python3 tests/tao_ho_so_mau.py` tạo hồ sơ mẫu có cài lỗi; `python3 tests/chay_thu.py` chạy toàn bộ và xuất file vào `tests/out/`.
 
+### File lớn
+
+App đọc theo luồng nên chạy được hồ sơ quyết toán nặng (thử với file 17 MB, 70 sheet: đọc khoảng 15–25 giây, quét dưới 2 giây):
+- tự bỏ khối tên vùng (defined names) rác – có file chứa tới 80 MB tên vùng làm treo app bản cũ;
+- mỗi sheet đọc tối đa 8.000 dòng, 60 cột, dừng khi gặp 300 dòng trống liên tiếp;
+- sheet ẩn mặc định Bỏ qua (vẫn báo ở CH-08); dòng ẩn chỉ xét ở bảng tổng hợp;
+- nhiều bảng tổng hợp lặp cùng số liệu (THKL, bảng giá trị…) thì cùng một lỗi chỉ báo một lần, ghi chú "trùng ở sheet …".
+
 ### Bảo mật
 
 Không nhập API key: mọi xử lý chạy trên máy chạy app, hồ sơ không gửi đi đâu. Bấm AI rà soát bổ sung: bảng tổng hợp (tối đa 160 dòng tỷ trọng lớn nhất) và các điểm đã phát hiện được gửi tới nhà cung cấp AI đã chọn. Key chỉ giữ trong phiên, trừ khi chủ động bấm Lưu key (file `.secrets.json` cạnh app, đã loại khỏi git).

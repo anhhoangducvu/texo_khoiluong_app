@@ -13,7 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from .table import detect, parse, guess_role, QTY_KEYS
-from .text import norm, contains_word, kw_in, fmt, pct, unit_label
+from .text import norm, contains_word, kw_in, kw_pos, fmt, pct, unit_label
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RULES = os.path.join(os.path.dirname(HERE), "rules", "quy_tac_tu_dong.json")
@@ -118,9 +118,11 @@ class SheetAnalysis:
 def analyze(book, overrides=None):
     """overrides: {tên sheet: {"role": ..., "header_row": int, "data_start": int, "cols": {...}}}"""
     overrides = overrides or {}
-    out = []
+    plan = []
     for sh in book.sheets:
-        tmap = detect(sh)
+        if getattr(sh, "_tmap", None) is None:
+            sh._tmap = detect(sh)                      # nhận diện một lần, lưu lại
+        tmap = copy.deepcopy(sh._tmap)
         ov = overrides.get(sh.name) or {}
         if ov.get("cols") is not None:
             tmap.cols = {k: v for k, v in ov["cols"].items() if v is not None}
@@ -128,7 +130,14 @@ def analyze(book, overrides=None):
             tmap.header_row = ov["header_row"]
         if ov.get("data_start") is not None:
             tmap.data_start = ov["data_start"]
-        role = ov.get("role") or guess_role(sh, tmap)
+        # Sheet ẩn mặc định bỏ qua (thường là bản cũ, bản nháp); vẫn được báo ở CH-08
+        role = ov.get("role") or ("Bỏ qua" if sh.hidden else guess_role(sh, tmap))
+        plan.append((sh, tmap, role))
+    if hasattr(book, "path"):
+        from . import reader as _reader
+        _reader.load_formulas(book, {sh.name for sh, _, role in plan if role == "Tổng hợp"})
+    out = []
+    for sh, tmap, role in plan:
         items, totals = parse(sh, tmap) if role != "Bỏ qua" else ([], [])
         a = SheetAnalysis(name=sh.name, role=role, tmap=tmap, items=items, totals=totals,
                           hidden=sh.hidden, errors=sh.errors, kind=sh.kind)
@@ -263,12 +272,30 @@ class Runner:
             c = sa.tmap.cols
             if not all(k in c for k in ("truoc", "kynay", "luyke")):
                 continue
+            zero = []
             for it in sa.items:
                 tr, kn, lk = it.get("truoc") or 0, it.get("kynay") or 0, it.get("luyke")
                 if lk is None or (tr == 0 and kn == 0):
                     continue
+                if lk == 0 and kn == 0 and tr > 0:
+                    zero.append(it)                     # đã nghiệm thu trước đây nhưng lũy kế về 0
+                    continue
                 if not self.close(tr + kn, lk):
                     self.add(r, sa, it, truoc=fmt(tr), kynay=fmt(kn), tong=fmt(tr + kn), luyke=fmt(lk))
+            if zero:
+                zero.sort(key=lambda x: -((x.get("truoc") or 0) * (x.get("dongia") or 0)))
+                tts = [t for t in (_tt(x, sa) for x in zero) if t]
+                rr = dict(r, muc="Trung bình",
+                          van_de="{n} dòng đã có khối lượng kỳ trước nhưng lũy kế bằng 0 (giảm trừ toàn bộ hoặc "
+                                 "chuyển sang dòng khác), các dòng: {cac_dong}.",
+                          cau_hoi="Khối lượng các dòng này chuyển đi đâu? Có biên bản điều chỉnh, giảm trừ không? "
+                                  "Dòng thay thế (nếu có) có cộng trùng không?",
+                          kiem_chung="Đối chiếu biên bản nghiệm thu các đợt trước và biên bản điều chỉnh khối lượng.")
+                f = self.add(rr, sa, None, rid="giam_tru_toan_bo", group=False,
+                             hang_muc=f"{zero[0].ten[:60]} (và {len(zero) - 1} dòng khác)" if len(zero) > 1 else zero[0].ten,
+                             khoi_luong="", ty_trong=None, n=len(zero), cac_dong=_rows(zero, 12))
+                f.phan = zero[0].phan
+                f.rows = [x.label for x in zero]
 
     def chk_dot_chiem_ty_le(self, r):
         tl = float((r.get("tham_so") or {}).get("ty_le", 0.6))
@@ -295,6 +322,8 @@ class Runner:
             for it in sa.items:
                 groups[(norm(it.section), norm(it.ma), norm(it.ten), it.dvt)].append(it)
             for k, lst in groups.items():
+                # chỉ coi là trùng khi các dòng nằm gần nhau (≤ 40 dòng); cùng tên ở phụ lục khác là bình thường
+                lst = [x for x in lst if any(y is not x and abs(y.idx - x.idx) <= 40 for y in lst)]
                 if len(lst) > 1 and any(x.q for x in lst):
                     top = max(lst, key=lambda x: x.value or 0)
                     f = self.add(r, sa, top, group=False, cac_dong=_rows(lst))
@@ -321,7 +350,8 @@ class Runner:
                 f.rows = [x.label for x in hits]
 
     def chk_dong_an(self, r):
-        for sa in self.an:
+        # Chỉ xét bảng tổng hợp; bảng diễn giải hay gom nhóm (outline) nên ẩn hàng loạt là bình thường
+        for sa in self.summary:
             for it in sa.items:
                 if it.hidden and (it.q or it.value):
                     self.add(r, sa, it)
@@ -337,10 +367,23 @@ class Runner:
             self.add(r, None, None, group=False, hang_muc="Cấu trúc file", noi_dung=" ".join(parts))
 
     def chk_o_loi(self, r):
+        summ_names = {a.name for a in self.summary}
+        others = []
         for sa in self.an:
-            if sa.errors:
+            if not sa.errors:
+                continue
+            if sa.name in summ_names:
                 self.add(r, sa, None, group=False, hang_muc="Ô lỗi công thức", so_o=len(sa.errors),
                          cac_o=", ".join(sa.errors[:10]) + ("…" if len(sa.errors) > 10 else ""))
+            else:
+                others.append(sa)
+        if others:
+            rr = dict(r, muc="Trung bình")
+            n = sum(len(a.errors) for a in others)
+            f = self.add(rr, None, None, group=False, hang_muc="Ô lỗi công thức ở bảng chi tiết", so_o=n,
+                         cac_o="; ".join(f"{a.name} ({len(a.errors)} ô, vd {a.errors[0]})" for a in others[:8])
+                         + ("…" if len(others) > 8 else ""))
+            f.vi_tri = f"{len(others)} sheet chi tiết"
 
     def chk_nhap_tay(self, r):
         if not self.details:
@@ -368,8 +411,8 @@ class Runner:
                         allv[k] += v
                     continue
                 n = norm(x.ten)
-                if n.startswith(("thue", "gia tri sau", "gia tri truoc")):
-                    continue
+                if "thue" in n or "vat" in n.split() or n.startswith(("gia tri sau", "gia tri truoc")):
+                    continue                                  # dòng có thuế không phải phép cộng thuần
                 bad = None
                 for k in vkeys:
                     w = x.get(k)
@@ -525,14 +568,18 @@ class Runner:
                 if hit:
                     self.add(r, sa, it, rid=r["ma"] + "|" + r.get("ten", ""), tu_khoa=hit)
 
+    MEASURE = {"m3", "m2", "100m2", "100m3", "m", "100m", "tan", "kg", "10m3", "km"}
+
     def rule_unit(self, r):
         ok = set(r.get("don_vi_hop_le") or [])
+        lim = int(r.get("vi_tri_toi_da", 20))      # từ khóa phải nằm ở đầu tên (công việc chính)
         for sa in self.summary:
             for it in sa.items:
-                if not it.dvt or it.dvt in ok:
+                # chỉ báo khi đơn vị là đơn vị đo lường rõ ràng nhưng khác loại (m² thay m³…)
+                if not it.dvt or it.dvt in ok or it.dvt not in self.MEASURE:
                     continue
                 hit = _match(it.ten, r)
-                if hit:
+                if hit and 0 <= kw_pos(it.ten, hit) <= lim:
                     self.add(r, sa, it, rid=r["ma"] + "|" + r.get("ten", ""), group=False, dvt=it.dvt_raw)
 
     def rule_ratio(self, r):
@@ -629,6 +676,25 @@ def _merge_same_row(findings):
     return keep
 
 
+def _dedupe_sheets(findings):
+    """Hồ sơ hay có nhiều bảng tổng hợp lặp lại cùng số liệu (THKL, giá trị, bảng vật tư…):
+    cùng quy tắc + cùng hạng mục + cùng khối lượng thì chỉ giữ một điểm, ghi chú sheet trùng."""
+    seen, out = {}, []
+    for f in findings:
+        if f.rows and len(f.rows) > 1:
+            key = (f.ma, f.ten_quy_tac, len(f.rows))
+        else:
+            key = (f.ma, norm(f.hang_muc)[:80], f.van_de)
+        if f.sheet and key in seen:
+            g = seen[key]
+            if f.sheet != g.sheet and f.sheet not in g.vi_tri:
+                g.vi_tri += f" (trùng ở sheet {f.sheet})"
+            continue
+        seen[key] = f
+        out.append(f)
+    return out
+
+
 def score(f, settings):
     dm = settings.get("diem_muc", {"Cao": 100, "Trung bình": 60, "Thấp": 20})
     hs = float(settings.get("he_so_ty_trong", 2.0))
@@ -663,7 +729,7 @@ def run_all(book, rules, overrides=None, prev_book=None, prev_overrides=None):
     prev = analyze(prev_book, prev_overrides) if prev_book else None
     runner = Runner(rules, analyses, book, prev)
     raw = runner.run()
-    grouped = _merge_same_row(_group(raw))
+    grouped = _dedupe_sheets(_merge_same_row(_group(raw)))
     return analyses, raw, grouped
 
 

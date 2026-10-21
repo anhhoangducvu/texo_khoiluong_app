@@ -1,6 +1,6 @@
 {
   "ten": "Bộ quy tắc tự động – rà soát nhanh hồ sơ khối lượng – Phòng Kỹ thuật TEXO",
-  "phien_ban": "1.0",
+  "phien_ban": "1.1",
   "cap_nhat": "2026-10-21",
   "ghi_chu": "File dùng chung cho app Streamlit và skill texo-khoiluong-radar. Mã quy tắc lấy theo skill (CH, DAO, VCD, CU, CKN, CTN, BTCT, HT, CT, HMC…). Thêm quy tắc mới: thêm một khối vào danh sách quy_tac, không dùng lại mã đã cấp. Từ khóa viết có dấu cho dễ đọc, khi so khớp app tự bỏ dấu.",
   "cai_dat": {
@@ -17,7 +17,7 @@
   "loai_quy_tac": {
     "he_thong": "Kiểm tra lập trình sẵn trong app (khóa 'kiem_tra'). Chỉ chỉnh được bật/tắt, mức, câu chữ, tham số.",
     "tu_khoa": "Tên công việc chứa một trong 'tu_khoa'; nếu có 'va_tu_khoa' thì phải chứa đủ các từ đó; nếu có 'va_tu_khoa_mot' thì phải chứa ít nhất một từ; không chứa từ nào trong 'tru_tu_khoa'. Có thể giới hạn theo 'don_vi'; 'chi_khi_co_kl': true thì chỉ báo khi dòng có khối lượng đề nghị.",
-    "don_vi": "Tên công việc khớp từ khóa thì đơn vị phải thuộc 'don_vi_hop_le'.",
+    "don_vi": "Tên công việc khớp từ khóa (từ khóa nằm trong 20 ký tự đầu – công việc chính, chỉnh bằng 'vi_tri_toi_da') thì đơn vị phải thuộc 'don_vi_hop_le'. Chỉ báo khi đơn vị là đơn vị đo lường (m3, m2, 100m2, m, tan, kg…), bỏ qua đơn vị đếm như cái, bộ, tủ.",
     "chi_so": "Tổng khối lượng nhóm 'tu_so' chia nhóm 'mau_so' trong cùng một sheet; nằm ngoài [min, max] (đã cộng dung sai) thì cảnh báo."
   },
   "quy_tac": [
@@ -279,6 +279,7 @@
     {"ma": "CT-01", "loai": "tu_khoa", "bat": true, "muc": "Trung bình", "phan": "Cải tạo",
      "ten": "Tháo dỡ, phá dỡ",
      "tu_khoa": ["tháo dỡ", "phá dỡ", "đục phá", "phá bỏ", "cạo bỏ"],
+     "tru_tu_khoa": ["ván khuôn", "cốp pha", "giàn giáo", "dàn giáo", "lắp dựng và tháo dỡ", "lắp đặt và tháo dỡ"],
      "chi_khi_co_kl": true,
      "van_de": "Có khối lượng \"{tu_khoa}\" – khó kiểm chứng sau khi làm.",
      "cau_hoi": "Có biên bản hiện trạng, ảnh trước khi phá dỡ không?",
@@ -358,7 +359,7 @@
 
     {"ma": "CH-06", "loai": "don_vi", "bat": true, "muc": "Cao", "phan": "Bê tông cốt thép",
      "ten": "Đơn vị bê tông",
-     "tu_khoa": ["bê tông"], "tru_tu_khoa": ["ván khuôn", "cốt thép", "bơm", "vận chuyển", "cọc ly tâm", "cọc dự ứng lực", "cọc bê tông", "ống cống", "gạch", "đập", "phá", "cắt", "khoan"],
+     "tu_khoa": ["bê tông"], "tru_tu_khoa": ["ván khuôn", "cốt thép", "bơm", "vận chuyển", "cọc ly tâm", "cọc dự ứng lực", "cọc bê tông", "ống cống", "ống bê tông", "gạch", "đập", "phá", "cắt", "khoan", "bê tông nhựa", "đúc sẵn", "cấu kiện", "tấm", "đục", "tháo"],
      "don_vi_hop_le": ["m3"],
      "van_de": "Công việc bê tông nhưng đơn vị là \"{dvt}\".",
      "cau_hoi": "Đơn vị tính có đúng như hợp đồng không?",
@@ -386,7 +387,7 @@
     {"ma": "CH-06", "loai": "don_vi", "bat": true, "muc": "Cao", "phan": "Hoàn thiện",
      "ten": "Đơn vị trát, sơn, lát, chống thấm, trần",
      "tu_khoa": ["trát", "sơn", "bả", "lát nền", "lát sàn", "láng", "chống thấm", "trần thạch cao", "ốp"],
-     "tru_tu_khoa": ["len", "phào", "nẹp", "chỉ", "má cửa", "gờ", "cạnh", "đá ngưỡng", "lan can", "sắt", "thép", "khung", "sơn kẻ", "vạch", "cửa", "cổ ống", "khe"],
+     "tru_tu_khoa": ["len", "phào", "nẹp", "chỉ", "má cửa", "gờ", "cạnh", "đá ngưỡng", "lan can", "sắt", "thép", "khung", "sơn kẻ", "vạch", "cửa", "cổ ống", "khe", "giao giữa", "mối nối", "tiếp giáp"],
      "don_vi_hop_le": ["m2", "100m2"],
      "van_de": "Công tác hoàn thiện nhưng đơn vị là \"{dvt}\".",
      "cau_hoi": "Đơn vị tính có đúng như hợp đồng không?",
