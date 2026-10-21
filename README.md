@@ -10,7 +10,7 @@ App là bộ lọc trước khi trình ký: đọc hồ sơ khối lượng củ
 4. Bước 2: bấm Rà soát. App chạy toàn bộ quy tắc, gom các dòng cùng lỗi, gộp nhiều lỗi trên cùng một dòng.
 5. Bước 3: sửa trực tiếp trong bảng: bỏ tick điểm không cần, tick thêm điểm ở cuối bảng, đổi mức, sửa câu hỏi, điền hồ sơ còn thiếu.
 6. Bước 4 (tùy chọn): có API key thì bấm AI rà soát bổ sung. AI đọc bảng tổng hợp và các điểm đã có, bổ sung tối đa 8 điểm (ghi Nguồn = AI), đề nghị đổi mức, gợi ý quy tắc mới.
-7. Bước 5: tải Excel mẫu TEXO (Tổng quan, Danh sách điểm, Thiếu hồ sơ, Giao việc, Kết quả quét), báo cáo trình ký Word nếu tick, và JSON kết quả để gửi Claude khi cần rà sâu hơn.
+7. Bước 5: tải Excel mẫu TEXO (Tổng quan, Danh sách điểm, Thiếu hồ sơ, Giao việc, Kết quả quét), báo cáo Word theo mẫu trình bày TEXO nếu tick (A4 dọc: tiêu đề, thẻ số liệu, hộp kết luận, thông tin hồ sơ, đề nghị, khối ký; phụ lục A4 ngang: bảng điểm có icon mức độ), và JSON kết quả để gửi Claude khi cần rà sâu hơn.
 
 ### Quy tắc đang kiểm tra tự động
 
